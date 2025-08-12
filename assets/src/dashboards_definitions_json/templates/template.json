@@ -16,6 +16,9 @@
                         }
                     }
                 },
+                "true_client_ip": {
+                    "type": "keyword"
+                },
                 "timestamp": {
                     "type": "date",
                     "format": "epoch_millis"

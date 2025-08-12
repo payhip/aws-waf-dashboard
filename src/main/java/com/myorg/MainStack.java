@@ -67,7 +67,7 @@ public class MainStack extends Stack {
     private void createParameters() {
         this.dataNodeEBSVolumeSize = CfnParameter.Builder.create(this, "osdfwOsEbsSize")
                 .type("Number")
-                .defaultValue("10")
+                .defaultValue("100")
                 .description("OpenSearch volume disk size")
                 .build();
 
@@ -121,7 +121,7 @@ public class MainStack extends Stack {
                         .masterNodes(0)
                         .dataNodes(1)
                         .warmNodes(0)
-                        .dataNodeInstanceType("r6g.large.search") //todo bug? passing param doesn't work
+                        .dataNodeInstanceType("r6g.xlarge.search") //todo bug? passing param doesn't work
                         .build())
                 .ebs(EbsOptions.builder()
                         .enabled(true)
