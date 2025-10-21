@@ -4,3 +4,7 @@ assets/os-customizer-lambda/
 node_modules
 target
 .DS_Store
+.idea/
+dist/
+cdk.out/
+target/

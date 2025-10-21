@@ -53,7 +53,20 @@ def create(event=None, context=None):
 
     service_settings.source_settings_from_event(event)
     import_index_templates(solution_components.templates)
-    action_dashboard_objects('POST')
+    # Purge any conflicting saved objects first (old copies with scripts)
+    purge_existing_objects()
+    # Recycle to ensure any existing saved objects are replaced with updated definitions
+    recycle_dashboards_objects()
+    # Permanently remove legacy scripted content and enforce correct fields
+    try:
+        remove_scripted_fields_from_index_pattern('awswaf-*')
+        strip_scripts_from_saved_objects()
+        enforce_terms_fields()
+        set_legacy_maps_tile_url()
+    except Exception as e:
+        logger.warning("Post-create cleanup encountered an issue: %s", e)
+    # Ensure the Data View picks up latest mappings automatically
+    refresh_index_pattern_fields('awswaf-*')
 
     return "MyResourceId"
 
@@ -64,7 +77,16 @@ def update(event=None, context=None):
     logger.debug("Sourcing additional settings from the event")
 
     service_settings.source_settings_from_event(event)
+    purge_existing_objects()
     recycle_dashboards_objects()
+    try:
+        remove_scripted_fields_from_index_pattern('awswaf-*')
+        strip_scripts_from_saved_objects()
+        enforce_terms_fields()
+        set_legacy_maps_tile_url()
+    except Exception as e:
+        logger.warning("Post-update cleanup encountered an issue: %s", e)
+    refresh_index_pattern_fields('awswaf-*')
     return "MyResourceId"
 
 
@@ -73,9 +95,19 @@ def delete(event=None, context=None):
     logger.info("Got Delete")
     logger.debug("Sourcing additional settings from the event")
 
-    service_settings.source_settings_from_event(event)
-    delete_index_templates()
-    delete_dashboards_objects()
+    try:
+        service_settings.source_settings_from_event(event)
+        try:
+            delete_index_templates()
+        except Exception as e:
+            logger.warning("Ignoring error deleting index templates during stack delete: %s", e)
+        try:
+            delete_dashboards_objects()
+        except Exception as e:
+            logger.warning("Ignoring error deleting dashboards objects during stack delete: %s", e)
+    except Exception as e:
+        logger.warning("Ignoring delete-time initialization error: %s", e)
+    # Always return success on Delete to prevent DELETE_FAILED if the domain no longer exists
     return True
 
 
@@ -133,6 +165,9 @@ def call_dashboards_api_for_resource(method, resource_type, resource_name, resou
     """
     f = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
     f.add(path=['_dashboards', 'api', 'saved_objects', resource_type, resource_name])
+    # Ensure we overwrite existing saved objects on POST to avoid stale field references
+    if method.upper() == 'POST':
+        f.add(query_params={'overwrite': 'true'})
 
     logging.info("Issuing %s to %s", method, f.url)
 
@@ -144,6 +179,267 @@ def call_dashboards_api_for_resource(method, resource_type, resource_name, resou
         logging.info("Request made but the resource was not found")
     else:
         raise Exception(response.text)
+
+
+def refresh_index_pattern_fields(title):
+    """
+    Programmatically refresh the Data View fields list to avoid stale field cache.
+    Looks up the index-pattern saved object by title and calls refresh_fields.
+    """
+    # Find index-pattern id by title
+    find_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    find_url.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+    find_url.add(query_params={'type': 'index-pattern', 'searchFields': 'title', 'search': title})
+    r = requests.get(find_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+    if not r.ok:
+        logger.warning("Index pattern search failed: %s", r.text)
+        return
+    results = r.json().get('saved_objects', [])
+    if not results:
+        logger.warning("Index pattern with title %s not found to refresh", title)
+        return
+    idx_id = results[0]['id']
+    # POST refresh_fields
+    ref_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    ref_url.add(path=['_dashboards', 'api', 'index_patterns', 'index_pattern', idx_id, 'refresh_fields'])
+    r2 = requests.post(ref_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+    if r2.ok:
+        logger.info("Refreshed fields for index-pattern %s", idx_id)
+    else:
+        logger.warning("Failed to refresh fields for index-pattern %s: %s", idx_id, r2.text)
+
+
+def remove_scripted_fields_from_index_pattern(title):
+    """Remove scripted fields from the specified Data View (index-pattern) by title."""
+    # Find index-pattern id by title
+    find_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    find_url.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+    find_url.add(query_params={'type': 'index-pattern', 'searchFields': 'title', 'search': title, 'per_page': 100})
+    r = requests.get(find_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+    if not r.ok:
+        logger.warning("Index pattern search failed (scripted fields cleanup): %s", r.text)
+        return
+    results = r.json().get('saved_objects', [])
+    if not results:
+        logger.warning("Index pattern %s not found for scripted fields cleanup", title)
+        return
+    idx_id = results[0]['id']
+
+    # Load full object
+    get_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    get_url.add(path=['_dashboards', 'api', 'saved_objects', 'index-pattern', idx_id])
+    g = requests.get(get_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+    if not g.ok:
+        logger.warning("Failed to load index-pattern %s: %s", idx_id, g.text)
+        return
+    body = g.json()
+    attrs = body.get('attributes', {})
+    fields_raw = attrs.get('fields') or '[]'
+    try:
+        fields = json.loads(fields_raw)
+    except Exception:
+        fields = []
+    # Remove any scripted fields entirely
+    cleaned = [f for f in fields if not (isinstance(f, dict) and f.get('scripted') is True)]
+    if len(cleaned) == len(fields):
+        logger.info("No scripted fields present in data view %s", title)
+    else:
+        attrs['fields'] = json.dumps(cleaned)
+        save_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+        save_url.add(path=['_dashboards', 'api', 'saved_objects', 'index-pattern', idx_id])
+        save_url.add(query_params={'overwrite': 'true'})
+        s = requests.post(save_url.url, auth=service_settings.aws_auth, headers=service_settings.headers,
+                          data=json.dumps({'attributes': attrs, 'references': body.get('references', [])}))
+        if s.ok:
+            logger.info("Removed scripted fields from data view %s (%s)", title, idx_id)
+        else:
+            logger.warning("Failed to update data view %s: %s", idx_id, s.text)
+
+
+def _strip_search_source_scripts(so_attrs):
+    changed = False
+    k = so_attrs.get('kibanaSavedObjectMeta') if isinstance(so_attrs, dict) else None
+    if not (isinstance(k, dict) and isinstance(k.get('searchSourceJSON', None), str)):
+        return changed, so_attrs
+    try:
+        ss = json.loads(k['searchSourceJSON'])
+    except Exception:
+        return changed, so_attrs
+    # Remove script_fields
+    if isinstance(ss.get('script_fields'), dict):
+        del ss['script_fields']
+        changed = True
+    # Remove scripted filters from both keys that may be used
+    for key in ['filter', 'filters']:
+        if isinstance(ss.get(key), list):
+            before = len(ss[key])
+            ss[key] = [f for f in ss[key] if 'script' not in json.dumps(f or {})]
+            if len(ss[key]) != before:
+                changed = True
+    # Normalize query
+    if not isinstance(ss.get('query'), dict):
+        ss['query'] = {'query': '', 'language': 'kuery'}
+        changed = True
+    k['searchSourceJSON'] = json.dumps(ss)
+    so_attrs['kibanaSavedObjectMeta'] = k
+    return changed, so_attrs
+
+
+def strip_scripts_from_saved_objects():
+    """Strip script_fields and scripted filters from all saved objects and unlink saved searches from visualizations."""
+    types = ['search', 'visualization', 'dashboard']
+    for t in types:
+        find_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+        find_url.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+        find_url.add(query_params={'type': t, 'per_page': 1000})
+        rf = requests.get(find_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+        if not rf.ok:
+            logger.warning("Failed to list %s: %s", t, rf.text)
+            continue
+        for obj in rf.json().get('saved_objects', []):
+            get_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+            get_url.add(path=['_dashboards', 'api', 'saved_objects', t, obj['id']])
+            ro = requests.get(get_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+            if not ro.ok:
+                continue
+            full = ro.json()
+            attrs = full.get('attributes', {})
+            changed, attrs = _strip_search_source_scripts(attrs)
+            if t == 'visualization':
+                # Unlink saved search and remove agg scripts
+                try:
+                    vis_state = json.loads(attrs.get('visState', '{}'))
+                    if isinstance(vis_state.get('params'), dict) and vis_state['params'].get('savedSearchId'):
+                        del vis_state['params']['savedSearchId']
+                        changed = True
+                    if isinstance(vis_state.get('aggs'), list):
+                        for a in vis_state['aggs']:
+                            if isinstance(a, dict) and isinstance(a.get('params'), dict) and 'script' in a['params']:
+                                del a['params']['script']
+                                changed = True
+                    attrs['visState'] = json.dumps(vis_state)
+                except Exception:
+                    pass
+                # Remove references to searches
+                if isinstance(full.get('references'), list) and any(r.get('type') == 'search' for r in full['references']):
+                    full['references'] = [r for r in full['references'] if r.get('type') != 'search']
+                    changed = True
+            if changed:
+                save_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+                save_url.add(path=['_dashboards', 'api', 'saved_objects', t, obj['id']])
+                save_url.add(query_params={'overwrite': 'true'})
+                requests.post(save_url.url, auth=service_settings.aws_auth, headers=service_settings.headers,
+                              data=json.dumps({'attributes': attrs, 'references': full.get('references', [])}))
+
+
+def enforce_terms_fields():
+    """Ensure key visualizations use canonical fields (no .keyword mistakes or scripts)."""
+    targets = {
+        'Top 10 User-Agents': 'UserAgent',
+        'Top 10 Hosts': 'host',
+        'Top 10 Rules': 'rule',
+        'Top 10 WebACL': 'webacl',
+        'Top 10 URI': 'uri',
+        'Top 10 IP Addresses': 'true_client_ip'
+    }
+    for title, field in targets.items():
+        # find by title
+        find_vis = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+        find_vis.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+        find_vis.add(query_params={'type': 'visualization', 'searchFields': 'title', 'search': title, 'per_page': 100})
+        rv = requests.get(find_vis.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+        if not rv.ok:
+            continue
+        for obj in rv.json().get('saved_objects', []):
+            get_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+            get_url.add(path=['_dashboards', 'api', 'saved_objects', 'visualization', obj['id']])
+            ro = requests.get(get_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+            if not ro.ok:
+                continue
+            full = ro.json()
+            attrs = full.get('attributes', {})
+            try:
+                vis_state = json.loads(attrs.get('visState', '{}'))
+                changed = False
+                for a in vis_state.get('aggs', []):
+                    if a.get('type') == 'terms':
+                        params = a.get('params', {})
+                        if params.get('field') != field:
+                            params['field'] = field
+                            a['params'] = params
+                            changed = True
+                if changed:
+                    attrs['visState'] = json.dumps(vis_state)
+                    save_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+                    save_url.add(path=['_dashboards', 'api', 'saved_objects', 'visualization', obj['id']])
+                    save_url.add(query_params={'overwrite': 'true'})
+                    requests.post(save_url.url, auth=service_settings.aws_auth, headers=service_settings.headers,
+                                  data=json.dumps({'attributes': attrs, 'references': full.get('references', [])}))
+            except Exception:
+                continue
+
+
+def set_legacy_maps_tile_url():
+    """Prevent legacy Maps errors by setting a default OSM tile URL in Advanced Settings."""
+    url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    url.add(path=['_dashboards', 'api', 'kibana', 'settings'])
+    payload = {
+        'changes': {
+            'map.tilemap.url': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            'map.tilemap.options.attribution': '© OpenStreetMap contributors'
+        }
+    }
+    try:
+        r = requests.post(url.url, auth=service_settings.aws_auth, headers=service_settings.headers, data=json.dumps(payload))
+        if r.ok:
+            logger.info("Set legacy map tile URL in Advanced Settings")
+        else:
+            logger.warning("Failed to set legacy map tile URL: %s", r.text)
+    except Exception as e:
+        logger.warning("Advanced settings update not supported or failed: %s", e)
+
+
+def purge_existing_objects():
+    """Remove any conflicting saved objects by title to prevent stale scripted configs."""
+    # Delete all index-patterns with title awswaf-*
+    find_ip = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    find_ip.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+    find_ip.add(query_params={'type': 'index-pattern', 'searchFields': 'title', 'search': 'awswaf-*', 'per_page': 100})
+    r = requests.get(find_ip.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+    if r.ok:
+        for obj in r.json().get('saved_objects', []):
+            del_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+            del_url.add(path=['_dashboards', 'api', 'saved_objects', 'index-pattern', obj['id']])
+            requests.delete(del_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+
+    # Delete dashboard titled WAFDashboard
+    find_dash = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    find_dash.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+    find_dash.add(query_params={'type': 'dashboard', 'searchFields': 'title', 'search': 'WAFDashboard', 'per_page': 100})
+    r2 = requests.get(find_dash.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+    if r2.ok:
+        for obj in r2.json().get('saved_objects', []):
+            del_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+            del_url.add(path=['_dashboards', 'api', 'saved_objects', 'dashboard', obj['id']])
+            requests.delete(del_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+
+    # Delete visualizations we manage (by known titles)
+    vis_titles = [
+        'HTTP Methods','HTTP Versions','Top 10 URI','Top 10 Hosts','Top 10 WebACL',
+        'Top 10 User-Agents','Executed WAF Rules','Countries By Number of Request',
+        'All vs Blocked Requests','Requests Count','Unique IP Count','Top 10 IP Addresses',
+        'Top 10 Countries','Top 10 Rules'
+    ]
+    for t in vis_titles:
+        find_vis = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+        find_vis.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+        find_vis.add(query_params={'type': 'visualization', 'searchFields': 'title', 'search': t, 'per_page': 100})
+        rv = requests.get(find_vis.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+        if rv.ok:
+            for obj in rv.json().get('saved_objects', []):
+                del_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+                del_url.add(path=['_dashboards', 'api', 'saved_objects', 'visualization', obj['id']])
+                requests.delete(del_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
 
 
 def import_index_templates(templates):

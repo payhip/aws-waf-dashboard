@@ -92,7 +92,7 @@ public class MainStack extends Stack {
 
         this.cognitoDomainName = CfnParameter.Builder.create(this, "osdfwCognitoDomain")
                 .type("String")
-                .defaultValue("osdfwdomain")
+                .defaultValue("osdfwdomain" + System.currentTimeMillis())
                 //todo lowercase only allowed
                 .description("Name for Cognito Domain")
                 .build();

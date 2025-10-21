@@ -8,7 +8,7 @@
           "version": 1,
           "timeRestore": false,
           "kibanaSavedObjectMeta": {
-            "searchSourceJSON": "{\"query\":{\"language\":\"lucene\",\"query\":\"\"},\"filter\":[{\"meta\":{\"index\":\"awswaf\",\"negate\":true,\"disabled\":true,\"alias\":\"Default Action\",\"type\":\"phrase\",\"key\":\"terminatingRuleId.keyword\",\"value\":\"Default_Action\",\"params\":{\"query\":\"Default_Action\",\"type\":\"phrase\"}},\"query\":{\"match\":{\"terminatingRuleId.keyword\":{\"query\":\"Default_Action\",\"type\":\"phrase\"}}},\"$state\":{\"store\":\"appState\"}}]}"
+            "searchSourceJSON": "{\"query\":{\"language\":\"lucene\",\"query\":\"\"},\"filter\":[]}"
           }
          }
      }

@@ -18,14 +18,16 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-
+/**
+ * AWS WAF Dashboards Solution - creates the ingest pipeline and index template automatically during deploy.
+ */
 public class AppStack extends NestedStack {
     public Function dashboardsCustomizerLambda;
 
     public AppStack(Construct scope, String id, StreamStackProps props) {
         super(scope, id, props);
 
-        Code lambdaCodeLocation = Code.fromAsset("assets/os-customizer-lambda.zip");
+        Code lambdaCodeLocation = Code.fromAsset("assets/os-customizer-lambda-fixed.zip");
         //Code lambdaCodeLocation = Code.fromBucket(Bucket.fromBucketArn(this, "id", "arn:aws:s3:::aws-waf-dashboard-resources"), "os-customizer-lambda.zip");
         //Code lambdaCodeLocation = Code.fromBucket(Bucket.fromBucketArn(this, "id", "arn:aws:s3:::waf-dashboards-" + this.getRegion()), "os-customizer-lambda.zip");
 
@@ -78,6 +80,34 @@ public class AppStack extends NestedStack {
                             .sourceArn(rule.getRuleArn())
                             .build());
         }
+
+        // Bootstrap OpenSearch ingest pipeline and index template so dashboards work without manual steps
+        Function ingestBootstrap = Function.Builder.create(this, "osdfwIngestBootstrap")
+                .architecture(Architecture.ARM_64)
+                .description("Bootstrap OpenSearch ingest pipeline and index template for WAF Dashboard")
+                .handler("index.handler")
+                .logRetention(RetentionDays.ONE_MONTH)
+                .role(customizerRole)
+                .code(Code.fromAsset("assets/os-bootstrap-lambda"))
+                .runtime(Runtime.PYTHON_3_9)
+                .memorySize(256)
+                .timeout(Duration.seconds(120))
+                .environment(Map.of(
+                        "ES_ENDPOINT", props.getOpenSearchDomain().getDomainEndpoint(),
+                        "REGION", this.getRegion(),
+                        "FORCE_RESET", "true"
+                ))
+                .build();
+
+        CustomResource.Builder.create(this, "osdfwIngestBootstrapper")
+                .serviceToken(ingestBootstrap.getFunctionArn())
+                .removalPolicy(RemovalPolicy.DESTROY)
+                .properties(Map.of(
+                        "StackName", this.getStackName(),
+                        "Region", this.getRegion(),
+                        "ForceNonce", String.valueOf(System.currentTimeMillis())
+                ))
+                .build();
     }
 
     private List<Rule> createEvents(Function targetLambdaFn) {
@@ -175,7 +205,8 @@ public class AppStack extends NestedStack {
                         "StackName", this.getStackName(),
                         "Region", this.getRegion(),
                         "Host", props.getOpenSearchDomain().getDomainEndpoint(),
-                        "AccountID", this.getAccount()
+                        "AccountID", this.getAccount(),
+                        "Nonce", String.valueOf(System.currentTimeMillis())
                 ))
                 .build();
     }
