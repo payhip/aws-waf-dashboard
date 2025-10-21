@@ -84,3 +84,38 @@ That's all! Now, your WAF logs will be send from WAF service throug Kinesis Fire
 Important! By the default, OpenSearch dashboard will be publicly accessible from Internet (although only Administrator will be able to create users who will be able to log in via Cognito). In production environment, we recomend to put a proxy in front of it, to allow access only from specific IP addresses.
 
 <img src="graphics/3.png" width="700">
+
+## Testing and Endpoints
+
+- **OpenSearch Dashboards URL**: `https://search-osdfw-opensearch-domain-o4qqwqklqckzntadqra5u77axa.us-east-1.es.amazonaws.com/_dashboards`
+- **Login (example)**: `hamzaawanit@gmail.com` / `HAMZAawan@123`
+- In Dashboards, open `WAFDashboard`, set time to **Last 15 minutes**, then click **Refresh**.
+
+### Finding your application hostname (your-app-hostname)
+- **If using CloudFront**: Console → CloudFront → Distributions → copy the Distribution Domain name (e.g., `dxxxxx.cloudfront.net`).
+- **If using ALB**: Console → EC2 → Load Balancers → select your ALB → copy the **DNS name** (e.g., `my-alb-1234.us-east-1.elb.amazonaws.com`). If the app expects a custom hostname, add a `Host` header in curl (see below).
+
+### Generate test traffic (cURL)
+Replace placeholders before running.
+
+Basic (sets client IP explicitly):
+
+```bash
+curl -k -sS \
+  -H "User-Agent: Client-Demo" \
+  -H "True-Client-IP: 203.0.113.77" \
+  -H "X-Forwarded-For: 203.0.113.77, 10.0.0.5" \
+  https://<your-app-hostname>/test
+```
+
+ALB DNS with app Host header:
+
+```bash
+curl -k -sS \
+  -H "Host: <your-app-hostname>" \
+  -H "True-Client-IP: 203.0.113.77" \
+  -H "X-Forwarded-For: 203.0.113.77" \
+  https://<your-alb-dns-name>/test
+```
+
+After 1–2 requests, refresh the dashboard. You should see `Top 10 IP Addresses` populated with `true_client_ip` and associated metrics.
