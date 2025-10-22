@@ -136,3 +136,59 @@ cp -R assets/src/* "$BUILD_DIR"/
 
 # Deploy (adjust parameters)
 cdk deploy --parameters osdfwDashboardsAdminEmail=<yourEmail> --parameters osdfwCognitoDomain=<uniqueCognitoDomain>
+
+### Post-deploy maintenance (required after any code pull/deploy)
+
+After deploying or pulling latest code, run the updater Lambda maintenance once to ensure saved objects and Data View are normalized to canonical fields.
+
+- Console (recommended):
+
+```
+Lambda → us-east-1 → function:
+OSDfW-AppNestedStackAppNe-osdfwDashboardsUpdater66-asodKL6y7dOC
+
+Test event JSON:
+{
+  "Action": "RefreshAndNormalize"
+}
+```
+
+- AWS CLI v2:
+
+```bash
+aws lambda invoke \
+  --region us-east-1 \
+  --function-name OSDfW-AppNestedStackAppNe-osdfwDashboardsUpdater66-asodKL6y7dOC \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"Action":"RefreshAndNormalize"}' \
+  /dev/stdout
+```
+
+- Python one-liner:
+
+```bash
+python3 -c "import boto3, json; print(boto3.client('lambda', region_name='us-east-1').invoke(FunctionName='OSDfW-AppNestedStackAppNe-osdfwDashboardsUpdater66-asodKL6y7dOC', Payload=json.dumps({'Action':'RefreshAndNormalize'}).encode()).get('Payload').read().decode())"
+```
+
+Then refresh the Data View field cache:
+
+- OpenSearch Dashboards → Stack Management → Data Views → open `awswaf-*` → click “Refresh field list” → Save.
+- Hard refresh the browser and open `WAFDashboard`.
+
+### What maintenance does
+
+- Purges/recycles saved objects to latest definitions under `assets/src/dashboards_definitions_json/`.
+- Removes scripted fields and scripted filters.
+- Normalizes fields to canonical names used by the index (examples):
+  - `httpRequest.clientIp(.keyword)` → `true_client_ip`
+  - `httpRequest.country.keyword` → `real_country_code`
+  - `httpRequest.uri.keyword` → `uri`
+  - `httpRequest.httpMethod.keyword`/`method` → `httpMethod`
+  - `httpRequest.httpVersion.keyword`/`version` → `httpVersion`
+  - `httpRequest.host(.keyword)`/`Host` → `host`
+  - `action(.keyword)` → `action`
+
+### Troubleshooting
+
+- If a panel shows “Could not locate index-pattern-field …”, run the maintenance action and refresh the Data View as above.
+- If Filters controls fail to fetch terms, check they reference `action`, `real_country_code`, `true_client_ip`, and (if present) `host`.

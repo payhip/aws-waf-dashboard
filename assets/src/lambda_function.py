@@ -63,6 +63,7 @@ def create(event=None, context=None):
         strip_scripts_from_saved_objects()
         enforce_terms_fields()
         set_legacy_maps_tile_url()
+        normalize_fields_and_controls()
     except Exception as e:
         logger.warning("Post-create cleanup encountered an issue: %s", e)
     # Ensure the Data View picks up latest mappings automatically
@@ -76,6 +77,26 @@ def update(event=None, context=None):
     logger.info("Got Update.")
     logger.debug("Sourcing additional settings from the event")
 
+    # Support direct maintenance invoke when handler is lambda_function.update
+    if isinstance(event, dict) and event.get('Action') == 'RefreshAndNormalize':
+        logger.info("Direct maintenance via update(): recycle + normalize + refresh fields")
+        try:
+            service_settings.source_settings_from_event(event or {})
+        except Exception:
+            pass
+        purge_existing_objects()
+        recycle_dashboards_objects()
+        try:
+            remove_scripted_fields_from_index_pattern('awswaf-*')
+            strip_scripts_from_saved_objects()
+            enforce_terms_fields()
+            set_legacy_maps_tile_url()
+            normalize_fields_and_controls()
+        except Exception as e:
+            logger.warning("Direct maintenance cleanup (update) encountered an issue: %s", e)
+        refresh_index_pattern_fields('awswaf-*')
+        return {"status": "ok"}
+
     service_settings.source_settings_from_event(event)
     purge_existing_objects()
     recycle_dashboards_objects()
@@ -84,6 +105,7 @@ def update(event=None, context=None):
         strip_scripts_from_saved_objects()
         enforce_terms_fields()
         set_legacy_maps_tile_url()
+        normalize_fields_and_controls()
     except Exception as e:
         logger.warning("Post-update cleanup encountered an issue: %s", e)
     refresh_index_pattern_fields('awswaf-*')
@@ -118,6 +140,31 @@ def poll_create(event=None, context=None):
 
 
 def handler(event, context):
+    # Allow direct invocation to run maintenance without CloudFormation
+    try:
+        if isinstance(event, dict) and event.get('Action') == 'RefreshAndNormalize':
+            logger.info("Running direct maintenance: recycle + normalize + refresh fields")
+            try:
+                # Ensure service settings are initialized from env
+                service_settings.source_settings_from_event(event or {})
+            except Exception:
+                pass
+            # Do the same steps as in create/update
+            purge_existing_objects()
+            recycle_dashboards_objects()
+            try:
+                remove_scripted_fields_from_index_pattern('awswaf-*')
+                strip_scripts_from_saved_objects()
+                enforce_terms_fields()
+                set_legacy_maps_tile_url()
+                normalize_fields_and_controls()
+            except Exception as e:
+                logger.warning("Direct maintenance cleanup encountered an issue: %s", e)
+            refresh_index_pattern_fields('awswaf-*')
+            return {"status": "ok"}
+    except Exception as e:
+        logger.warning("Direct maintenance path failed: %s", e)
+    # Fallback to Custom Resource handler
     helper(event, context)
 
 
@@ -189,7 +236,7 @@ def refresh_index_pattern_fields(title):
     # Find index-pattern id by title
     find_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
     find_url.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
-    find_url.add(query_params={'type': 'index-pattern', 'searchFields': 'title', 'search': title})
+    find_url.add(query_params={'type': 'index-pattern', 'search_fields': 'title', 'search': title, 'per_page': 100})
     r = requests.get(find_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
     if not r.ok:
         logger.warning("Index pattern search failed: %s", r.text)
@@ -201,7 +248,8 @@ def refresh_index_pattern_fields(title):
     idx_id = results[0]['id']
     # POST refresh_fields
     ref_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
-    ref_url.add(path=['_dashboards', 'api', 'index_patterns', 'index_pattern', idx_id, 'refresh_fields'])
+    # Correct endpoint for OpenSearch Dashboards: /api/index_patterns/index_pattern/{id}/fields/refresh
+    ref_url.add(path=['_dashboards', 'api', 'index_patterns', 'index_pattern', idx_id, 'fields', 'refresh'])
     r2 = requests.post(ref_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
     if r2.ok:
         logger.info("Refreshed fields for index-pattern %s", idx_id)
@@ -214,7 +262,7 @@ def remove_scripted_fields_from_index_pattern(title):
     # Find index-pattern id by title
     find_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
     find_url.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
-    find_url.add(query_params={'type': 'index-pattern', 'searchFields': 'title', 'search': title, 'per_page': 100})
+    find_url.add(query_params={'type': 'index-pattern', 'search_fields': 'title', 'search': title, 'per_page': 100})
     r = requests.get(find_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
     if not r.ok:
         logger.warning("Index pattern search failed (scripted fields cleanup): %s", r.text)
@@ -334,6 +382,22 @@ def strip_scripts_from_saved_objects():
 
 def enforce_terms_fields():
     """Ensure key visualizations use canonical fields (no .keyword mistakes or scripts)."""
+    field_map = {
+        'httpRequest.clientIp.keyword': 'true_client_ip',
+        'httpRequest.clientIp': 'true_client_ip',
+        'httpRequest.country.keyword': 'real_country_code',
+        'httpRequest.uri.keyword': 'uri',
+        'httpRequest.httpMethod.keyword': 'httpMethod',
+        'httpRequest.httpVersion.keyword': 'httpVersion',
+        'method': 'httpMethod',
+        'version': 'httpVersion',
+        'httpRequest.host.keyword': 'host',
+        'httpRequest.host': 'host',
+        'Host': 'host',
+        # Ensure action uses the canonical keyword field name present in Data View
+        'action.keyword': 'action',
+        'action': 'action'
+    }
     targets = {
         'Top 10 User-Agents': 'UserAgent',
         'Top 10 Hosts': 'host',
@@ -362,12 +426,17 @@ def enforce_terms_fields():
                 vis_state = json.loads(attrs.get('visState', '{}'))
                 changed = False
                 for a in vis_state.get('aggs', []):
-                    if a.get('type') == 'terms':
-                        params = a.get('params', {})
-                        if params.get('field') != field:
-                            params['field'] = field
-                            a['params'] = params
-                            changed = True
+                    params = a.get('params', {}) if isinstance(a, dict) else {}
+                    f = params.get('field')
+                    if f in field_map and field_map[f] != f:
+                        params['field'] = field_map[f]
+                        a['params'] = params
+                        changed = True
+                    # Normalize action to canonical name if applicable
+                    if f == 'action':
+                        params['field'] = 'action'
+                        a['params'] = params
+                        changed = True
                 if changed:
                     attrs['visState'] = json.dumps(vis_state)
                     save_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
@@ -379,6 +448,105 @@ def enforce_terms_fields():
                 continue
 
 
+def normalize_fields_and_controls():
+    """Rewrite legacy httpRequest.* fields to canonical ones across all visualizations and Filters control."""
+    field_map = {
+        'httpRequest.clientIp.keyword': 'true_client_ip',
+        'httpRequest.clientIp': 'true_client_ip',
+        'httpRequest.country.keyword': 'real_country_code',
+        'httpRequest.uri.keyword': 'uri',
+        'httpRequest.httpMethod.keyword': 'httpMethod',
+        'httpRequest.httpVersion.keyword': 'httpVersion',
+        'method': 'httpMethod',
+        'version': 'httpVersion',
+        'httpRequest.host.keyword': 'host',
+        'httpRequest.host': 'host',
+        'Host': 'host',
+        'action.keyword': 'action',
+        'action': 'action'
+    }
+
+    # Update all visualizations' fields (any agg.param.field)
+    find_vis = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+    find_vis.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+    find_vis.add(query_params={'type': 'visualization', 'per_page': 1000})
+    rv = requests.get(find_vis.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+    if rv.ok:
+        for obj in rv.json().get('saved_objects', []):
+            get_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+            get_url.add(path=['_dashboards', 'api', 'saved_objects', 'visualization', obj['id']])
+            ro = requests.get(get_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+            if not ro.ok:
+                continue
+            full = ro.json()
+            attrs = full.get('attributes', {})
+            changed = False
+            try:
+                vis_state = json.loads(attrs.get('visState', '{}'))
+                for a in vis_state.get('aggs', []):
+                    if not isinstance(a, dict):
+                        continue
+                    params = a.get('params', {}) if isinstance(a.get('params'), dict) else {}
+                    f = params.get('field')
+                    if f in field_map and field_map[f] != f:
+                        params['field'] = field_map[f]
+                        a['params'] = params
+                        changed = True
+                    if f == 'action':
+                        params['field'] = 'action'
+                        a['params'] = params
+                        changed = True
+                if changed:
+                    attrs['visState'] = json.dumps(vis_state)
+            except Exception:
+                changed = False
+            if changed:
+                save_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+                save_url.add(path=['_dashboards', 'api', 'saved_objects', 'visualization', obj['id']])
+                save_url.add(query_params={'overwrite': 'true'})
+                requests.post(save_url.url, auth=service_settings.aws_auth, headers=service_settings.headers,
+                              data=json.dumps({'attributes': attrs, 'references': full.get('references', [])}))
+
+    # Update Filters control by title
+    try:
+        find_filters = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+        find_filters.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
+        find_filters.add(query_params={'type': 'visualization', 'search_fields': 'title', 'search': 'Filters', 'per_page': 100})
+        rf = requests.get(find_filters.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+        for obj in (rf.json().get('saved_objects', []) if rf.ok else []):
+            get_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+            get_url.add(path=['_dashboards', 'api', 'saved_objects', 'visualization', obj['id']])
+            ro = requests.get(get_url.url, auth=service_settings.aws_auth, headers=service_settings.headers)
+            if not ro.ok:
+                continue
+            full = ro.json()
+            attrs = full.get('attributes', {})
+            changed = False
+            try:
+                vis_state = json.loads(attrs.get('visState', '{}'))
+                controls = vis_state.get('params', {}).get('controls', [])
+                for c in controls:
+                    fname = (c.get('fieldName') or c.get('field_name')) if isinstance(c, dict) else None
+                    if fname in field_map:
+                        c['fieldName'] = field_map[fname]
+                        changed = True
+                    if fname == 'action':
+                        c['fieldName'] = 'action'
+                        changed = True
+                if changed:
+                    vis_state.setdefault('params', {})['controls'] = controls
+                    attrs['visState'] = json.dumps(vis_state)
+            except Exception:
+                changed = False
+            if changed:
+                save_url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
+                save_url.add(path=['_dashboards', 'api', 'saved_objects', 'visualization', obj['id']])
+                save_url.add(query_params={'overwrite': 'true'})
+                requests.post(save_url.url, auth=service_settings.aws_auth, headers=service_settings.headers,
+                              data=json.dumps({'attributes': attrs, 'references': full.get('references', [])}))
+    except Exception as e:
+        logger.warning("Filters normalization failed: %s", e)
+
 def set_legacy_maps_tile_url():
     """Prevent legacy Maps errors by setting a default OSM tile URL in Advanced Settings."""
     url = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
@@ -386,7 +554,7 @@ def set_legacy_maps_tile_url():
     payload = {
         'changes': {
             'map.tilemap.url': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-            'map.tilemap.options.attribution': '© OpenStreetMap contributors'
+            'map.tilemap.options.attribution': ' OpenStreetMap contributors'
         }
     }
     try:
@@ -404,7 +572,7 @@ def purge_existing_objects():
     # Delete all index-patterns with title awswaf-*
     find_ip = furl(scheme="https", host=service_settings.host, port=service_settings.dashboards_port)
     find_ip.add(path=['_dashboards', 'api', 'saved_objects', '_find'])
-    find_ip.add(query_params={'type': 'index-pattern', 'searchFields': 'title', 'search': 'awswaf-*', 'per_page': 100})
+    find_ip.add(query_params={'type': 'index-pattern', 'search_fields': 'title', 'search': 'awswaf-*', 'per_page': 100})
     r = requests.get(find_ip.url, auth=service_settings.aws_auth, headers=service_settings.headers)
     if r.ok:
         for obj in r.json().get('saved_objects', []):
