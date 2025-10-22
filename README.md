@@ -119,3 +119,20 @@ curl -k -sS \
 ```
 
 After 1–2 requests, refresh the dashboard. You should see `Top 10 IP Addresses` populated with `true_client_ip` and associated metrics.
+
+### Rebuild customizer Lambda ZIP and deploy
+
+The CDK stacks reference `assets/os-customizer-lambda-fixed.zip` (see `src/main/java/com/myorg/AppStack.java`). Rebuild the ZIP from the current sources in `assets/src/` before deploying:
+
+```bash
+# From project root
+BUILD_DIR=assets/os-customizer-build
+ZIP_OUT=assets/os-customizer-lambda-fixed.zip
+
+rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"
+pip install --upgrade -t "$BUILD_DIR" requests furl requests-aws4auth
+cp -R assets/src/* "$BUILD_DIR"/
+(cd "$BUILD_DIR" && zip -r ../os-customizer-lambda-fixed.zip .)
+
+# Deploy (adjust parameters)
+cdk deploy --parameters osdfwDashboardsAdminEmail=<yourEmail> --parameters osdfwCognitoDomain=<uniqueCognitoDomain>
