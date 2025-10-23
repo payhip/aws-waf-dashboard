@@ -192,3 +192,32 @@ Then refresh the Data View field cache:
 
 - If a panel shows “Could not locate index-pattern-field …”, run the maintenance action and refresh the Data View as above.
 - If Filters controls fail to fetch terms, check they reference `action`, `real_country_code`, `true_client_ip`, and (if present) `host`.
+
+## Full teardown and fresh re-deploy (us-east-1)
+
+Warning: This is destructive. It deletes the CDK stack and the OpenSearch domain created by the solution.
+
+```bash
+# Region
+export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+
+# 1) Inspect stacks (safe)
+cdk list
+
+# 2) Destroy existing stack (destructive)
+cdk destroy OSDfW -f
+
+# 3) Bootstrap (idempotent; only needed once per account/region)
+cdk bootstrap
+
+# 4) Fresh deploy (use a globally unique Cognito domain value)
+DOMAIN="osdfw-hamza-$(date +%Y%m%d%H%M%S)"
+cdk deploy \
+  --parameters osdfwDashboardsAdminEmail=hamzaawanit@gmail.com \
+  --parameters osdfwCognitoDomain="$DOMAIN" \
+  -y
+```
+
+Notes:
+- Fresh stacks auto-run the customizer Lambda; Filters and fields are normalized by code. No manual maintenance invoke is required.
+- After deploy, log in to OpenSearch Dashboards (URL from CDK Outputs), then optionally refresh the `awswaf-*` Data View fields and reopen `WAFDashboard`.

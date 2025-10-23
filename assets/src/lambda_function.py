@@ -620,9 +620,13 @@ def import_index_templates(templates):
     logger.info("Firing index_template")
 
     for template in templates:
-        result = opensearch_client.indices.put_index_template("awswaf-logs",
-                                                              body=templates[template],
-                                                              params={'create': 'false', 'cause': 'Initial templates creation'})
+        # opensearch-py expects keyword-only args: name=, body=, params=
+        # Use the actual template name from the dict key
+        result = opensearch_client.indices.put_index_template(
+            name=template,
+            body=templates[template],
+            params={'create': 'false', 'cause': 'Initial templates creation'}
+        )
         logging.info(result)
 
 
