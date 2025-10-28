@@ -87,16 +87,37 @@ public class AppStack extends NestedStack {
                             .build());
         }
 
-        Function dashboardsFixerLambda = Function.Builder.create(this, "osdfwDashboardsFixer")
+        Function dashboardsFixerLambda = Function.Builder.create(this, "osdfwDashboardsFixerV2")
                 .architecture(Architecture.X86_64)
                 .description("Enforce country visuals to use real_country_code")
                 .handler("fix_country_objects.lambda_handler")
                 .logRetention(RetentionDays.ONE_MONTH)
-                .role(customizerRole)
                 .code(Code.fromAsset("assets/os-customizer-build"))
                 .runtime(Runtime.PYTHON_3_9)
                 .memorySize(128)
                 .timeout(Duration.seconds(300))
+                .initialPolicy(List.of(
+                        PolicyStatement.Builder.create()
+                                .effect(Effect.ALLOW)
+                                .actions(List.of(
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                ))
+                                .resources(List.of("*"))
+                                .build(),
+                        PolicyStatement.Builder.create()
+                                .effect(Effect.ALLOW)
+                                .actions(List.of(
+                                        // Allow signed HTTP calls to ES endpoints
+                                        "es:ESHttpGet",
+                                        "es:ESHttpPost",
+                                        "es:ESHttpPut",
+                                        "es:ESHttpDelete"
+                                ))
+                                .resources(List.of("*"))
+                                .build()
+                ))
                 .environment(Map.of(
                         "ES_ENDPOINT", props.getOpenSearchDomain().getDomainEndpoint(),
                         "REGION", this.getRegion()

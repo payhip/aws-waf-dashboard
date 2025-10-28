@@ -58,6 +58,43 @@ def make_signed_request(method, url, headers=None, data=None, params=None):
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode('utf-8')
 
+def seed_demo_docs(count: int = 80):
+    """Seed demo documents so Host and ASN visuals have data immediately."""
+    try:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        idx = f"awswaf-{today}"
+        # ensure index exists
+        make_signed_request('PUT', f"https://{ES_ENDPOINT}/{idx}")
+        # build bulk NDJSON
+        asns = ["13335","15169","20940","16509","8075","14618"]
+        hosts = ["demo.example.com","api.demo.example.com","test.demo.example.com"]
+        lines = []
+        for _ in range(count):
+            ts = datetime.now(timezone.utc).isoformat()
+            doc = {
+                "@timestamp": ts,
+                "timestamp": ts,
+                "host": random.choice(hosts),
+                "req_asn": random.choice(asns),
+                "real_country_code": random.choice(["US","PK","GB","DE","CA","SG"]),
+                "req_true_client_ip": f"203.0.113.{random.randint(10,220)}",
+                "webacl": "demo-webacl",
+                "rule": "demo-rule",
+                "rule_type": "REGULAR",
+                "action": random.choice(["ALLOW","BLOCK"])
+            }
+            lines.append(json.dumps({"index": {"_index": idx}}))
+            lines.append(json.dumps(doc))
+        body = ("\n".join(lines) + "\n").encode('utf-8')
+        bulk_headers = {'Content-Type': 'application/x-ndjson'}
+        sc, resp = make_signed_request('POST', f"https://{ES_ENDPOINT}/_bulk", headers=bulk_headers, data=body)
+        logger.info('seed_demo_docs bulk status=%s', sc)
+        return sc >= 200 and sc < 300
+    except Exception as e:
+        logger.warning('seed_demo_docs failed: %s', e)
+        return False
+
 def find_index_pattern_id(pattern_title):
     """Find the ID of an index pattern by title."""
     url = f"https://{ES_ENDPOINT}/_dashboards/api/saved_objects/_find"
@@ -79,12 +116,27 @@ def find_index_pattern_id(pattern_title):
     if status_code != 200:
         logger.warning(f"Failed to find index pattern {pattern_title}: {status_code} {response_body}")
         return None
-    
-    data = json.loads(response_body)
-    for hit in data.get('saved_objects', []):
-        if hit.get('attributes', {}).get('title') == pattern_title:
-            return hit.get('id')
+    try:
+        data = json.loads(response_body)
+        for hit in data.get('saved_objects', []):
+            if hit.get('attributes', {}).get('title') == pattern_title:
+                return hit.get('id')
+    except Exception:
+        pass
     return None
+
+def refresh_index_pattern_fields(pattern_title: str = 'awswaf-*'):
+    """Refresh data view fields so newly indexed fields (e.g., req_asn) appear immediately."""
+    headers = {
+        'osd-xsrf': 'true', 'kbn-xsrf': 'true', 'kbn-version': '7.10.2', 'osd-version': '1.0.0', 'Content-Type': 'application/json'
+    }
+    pid = find_index_pattern_id(pattern_title)
+    if not pid:
+        return False
+    url = f"https://{ES_ENDPOINT}/_dashboards/api/index_patterns/index_pattern/{pid}/refresh_fields"
+    sc, body = make_signed_request('POST', url, headers=headers)
+    logger.info('refresh_index_pattern_fields id=%s status=%s', pid, sc)
+    return sc >= 200 and sc < 300
 
 def import_country_objects():
     """Overwrite the four country visuals and return verification results per id."""
@@ -195,7 +247,8 @@ def import_country_objects():
         ('allcountries', region_map_vs('Countries By Number of Request')),
         ('blockedcountries', region_map_vs('Countries By Number of BLOCKED Request')),
         ('top10countries', table_vs),
-        ('top10webacl', asn_vs)
+        ('top10webacl', asn_vs),
+        ('top10hosts', hosts_vs)
     ]:
         logger.info(f"Processing visualization id={vid}")
         
@@ -239,6 +292,8 @@ def import_country_objects():
                 expected = 'real_country_code'
                 if vid == 'top10webacl':
                     expected = 'req_asn'
+                if vid == 'top10hosts':
+                    expected = 'host'
                 ok = (expected in vs_text)
             except Exception as e:
                 logger.warning(f"Error parsing response for {vid}: {e}")
@@ -288,8 +343,24 @@ def ensure_index_pattern_timefield(pattern_title: str = 'awswaf-*', time_field: 
     }
     pid = find_index_pattern_id(pattern_title)
     if not pid:
-        logger.warning('Index pattern not found for title=%s', pattern_title)
-        return False
+        # Create a stable index pattern with id 'awswaf'
+        logger.warning('Index pattern not found for title=%s, creating...', pattern_title)
+        create_url = f"https://{ES_ENDPOINT}/_dashboards/api/saved_objects/index-pattern/awswaf"
+        payload = json.dumps({'attributes': {'title': pattern_title, 'timeFieldName': time_field}}).encode('utf-8')
+        sc, body = make_signed_request('POST', create_url, headers=headers, data=payload)
+        logger.info('create index-pattern status=%s body=%s', sc, (body[:120] if isinstance(body, str) else body))
+        # Re-find
+        find_url = f"https://{ES_ENDPOINT}/_dashboards/api/saved_objects/_find"
+        sc, body = make_signed_request('GET', find_url, headers=headers, params={'type': 'index-pattern', 'search_fields': 'title', 'search': pattern_title})
+        if sc == 200:
+            data = json.loads(body)
+            for so in data.get('saved_objects', []):
+                if so.get('attributes', {}).get('title') == pattern_title:
+                    pid = so.get('id')
+                    break
+        if not pid:
+            logger.warning('Failed to create index pattern for title=%s', pattern_title)
+            return False
     url = f"https://{ES_ENDPOINT}/_dashboards/api/saved_objects/index-pattern/{pid}?overwrite=true"
     payload = json.dumps({'attributes': {'timeFieldName': time_field}}).encode('utf-8')
     sc, body = make_signed_request('PUT', url, headers=headers, data=payload)
@@ -300,17 +371,30 @@ def ensure_index_pattern_timefield(pattern_title: str = 'awswaf-*', time_field: 
 def lambda_handler(event, context):
     """Lambda handler: enforce visuals and index pattern consistently."""
     try:
-        # set correct time field and enforce visuals
-        try:
-            ensure_index_pattern_timefield('awswaf-*', '@timestamp')
-        except Exception:
-            pass
-        results = import_country_objects()
-        try:
-            ensure_top20asn_panel_on_dashboard('WAFDashboard', 'top10webacl')
-        except Exception:
-            pass
-        return {"status": "ok", "verified": results}
+        # Optional seeding for demo/testing
+        if isinstance(event, dict) and event.get('seed_demo'):
+            seed_demo_docs(80)
+            try:
+                refresh_index_pattern_fields('awswaf-*')
+            except Exception:
+                pass
+        # Auto-heal loop: ensure index pattern and enforce saved objects up to 3 times
+        last = {}
+        for attempt in range(1, 4):
+            try:
+                ensure_index_pattern_timefield('awswaf-*', '@timestamp')
+                refresh_index_pattern_fields('awswaf-*')
+            except Exception:
+                pass
+            last = import_country_objects()
+            try:
+                ensure_top20asn_panel_on_dashboard('WAFDashboard', 'top10webacl')
+            except Exception:
+                pass
+            if all(last.get(k, False) for k in ['filters','allcountries','blockedcountries','top10countries','top10webacl']):
+                break
+            import time as _t; _t.sleep(5)
+        return {"status": "ok", "verified": last, "attempts": attempt}
     except Exception as e:
         logger.exception("Error in lambda_handler")
         return {"status": "error", "message": str(e)}
@@ -343,7 +427,7 @@ def ensure_top20asn_panel_on_dashboard(dashboard_title: str, viz_id: str):
         logger.warning('ensure_top20asn_panel: dashboard title=%s not found', dashboard_title)
         return False
     # get dashboard
-    get_url = f"https://{ES_ENDPOINT}//_dashboards/api/saved_objects/dashboard/{did}"
+    get_url = f"https://{ES_ENDPOINT}/_dashboards/api/saved_objects/dashboard/{did}"
     sc, body = make_signed_request('GET', get_url, headers=headers)
     if sc != 200:
         logger.warning('ensure_top20asn_panel: get dashboard failed status=%s body=%s', sc, (body[:120] if isinstance(body,str) else body))
