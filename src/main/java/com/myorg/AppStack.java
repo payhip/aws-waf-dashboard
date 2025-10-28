@@ -2,6 +2,8 @@ package com.myorg;
 
 import software.amazon.awscdk.services.events.EventPattern;
 import software.amazon.awscdk.services.events.Rule;
+import software.amazon.awscdk.services.events.Schedule;
+import software.amazon.awscdk.services.events.CronOptions;
 import software.amazon.awscdk.services.events.targets.LambdaFunction;
 import software.amazon.awscdk.services.iam.*;
 import software.amazon.awscdk.services.lambda.Runtime;
@@ -13,6 +15,10 @@ import software.amazon.awscdk.NestedStack;
 import software.amazon.awscdk.CustomResource;
 import software.amazon.awscdk.RemovalPolicy;
 import software.amazon.awscdk.Duration;
+import software.amazon.awscdk.customresources.AwsCustomResource;
+import software.amazon.awscdk.customresources.AwsCustomResourcePolicy;
+import software.amazon.awscdk.customresources.AwsSdkCall;
+import software.amazon.awscdk.customresources.PhysicalResourceId;
 
 import java.util.List;
 import java.util.Locale;
@@ -42,7 +48,7 @@ public class AppStack extends NestedStack {
                 .code(lambdaCodeLocation)
                 .runtime(Runtime.PYTHON_3_9)
                 .memorySize(128)
-                .timeout(Duration.seconds(160))
+                .timeout(Duration.seconds(600))
                 .environment(Map.of(
                         "ES_ENDPOINT", props.getOpenSearchDomain().getDomainEndpoint(),
                         "REGION", this.getRegion(),
@@ -61,7 +67,7 @@ public class AppStack extends NestedStack {
                 .code(lambdaCodeLocation)
                 .runtime(Runtime.PYTHON_3_9)
                 .memorySize(128)
-                .timeout(Duration.seconds(160))
+                .timeout(Duration.seconds(600))
                 .environment(Map.of(
                         "ES_ENDPOINT", props.getOpenSearchDomain().getDomainEndpoint(),
                         "REGION", this.getRegion(),
@@ -81,6 +87,72 @@ public class AppStack extends NestedStack {
                             .build());
         }
 
+        Function dashboardsFixerLambda = Function.Builder.create(this, "osdfwDashboardsFixer")
+                .architecture(Architecture.X86_64)
+                .description("Enforce country visuals to use real_country_code")
+                .handler("fix_country_objects.lambda_handler")
+                .logRetention(RetentionDays.ONE_MONTH)
+                .role(customizerRole)
+                .code(Code.fromAsset("assets/os-customizer-build"))
+                .runtime(Runtime.PYTHON_3_9)
+                .memorySize(128)
+                .timeout(Duration.seconds(300))
+                .environment(Map.of(
+                        "ES_ENDPOINT", props.getOpenSearchDomain().getDomainEndpoint(),
+                        "REGION", this.getRegion()
+                ))
+                .build();
+
+        Rule dashboardsFixerNightly = Rule.Builder.create(this, "osdfwDashboardsFixerNightlyCFN")
+                .description("Nightly enforcement of country visuals (real_country_code)")
+                .schedule(Schedule.cron(CronOptions.builder().minute("0").hour("3").build()))
+                .targets(List.of(LambdaFunction.Builder.create(dashboardsFixerLambda).build()))
+                .enabled(true)
+                .build();
+
+        dashboardsFixerLambda.addPermission(
+                "allowEventsInvokeNightly",
+                Permission.builder()
+                        .action("lambda:InvokeFunction")
+                        .principal(new ServicePrincipal("events.amazonaws.com"))
+                        .sourceArn(dashboardsFixerNightly.getRuleArn())
+                        .build());
+
+        // Post-deploy auto-invoke via AWS SDK custom resource (runs on Create/Update)
+        AwsSdkCall invokeOnCreate = AwsSdkCall.builder()
+                .service("Lambda")
+                .action("invoke")
+                .parameters(Map.of(
+                        "FunctionName", dashboardsFixerLambda.getFunctionName(),
+                        "InvocationType", "Event",
+                        "Payload", "{}"
+                ))
+                .physicalResourceId(PhysicalResourceId.of("InvokeDashboardsFixerOnDeploy"))
+                .build();
+
+        AwsSdkCall invokeOnUpdate = AwsSdkCall.builder()
+                .service("Lambda")
+                .action("invoke")
+                .parameters(Map.of(
+                        "FunctionName", dashboardsFixerLambda.getFunctionName(),
+                        "InvocationType", "Event",
+                        "Payload", "{}"
+                ))
+                .physicalResourceId(PhysicalResourceId.of("InvokeDashboardsFixerOnDeploy"))
+                .build();
+
+        AwsCustomResource.Builder.create(this, "InvokeDashboardsFixerOnDeploy")
+                .onCreate(invokeOnCreate)
+                .onUpdate(invokeOnUpdate)
+                .policy(AwsCustomResourcePolicy.fromStatements(List.of(
+                        PolicyStatement.Builder.create()
+                                .effect(Effect.ALLOW)
+                                .actions(List.of("lambda:InvokeFunction"))
+                                .resources(List.of(dashboardsFixerLambda.getFunctionArn()))
+                                .build()
+                )))
+                .build();
+
         // Bootstrap OpenSearch ingest pipeline and index template so dashboards work without manual steps
         Function ingestBootstrap = Function.Builder.create(this, "osdfwIngestBootstrap")
                 .architecture(Architecture.ARM_64)
@@ -90,12 +162,12 @@ public class AppStack extends NestedStack {
                 .role(customizerRole)
                 .code(Code.fromAsset("assets/os-bootstrap-lambda"))
                 .runtime(Runtime.PYTHON_3_9)
-                .memorySize(256)
-                .timeout(Duration.seconds(120))
+                .memorySize(512)
+                .timeout(Duration.minutes(15))
                 .environment(Map.of(
                         "ES_ENDPOINT", props.getOpenSearchDomain().getDomainEndpoint(),
                         "REGION", this.getRegion(),
-                        "FORCE_RESET", "true"
+                        "FORCE_RESET", "false"
                 ))
                 .build();
 

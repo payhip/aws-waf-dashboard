@@ -1,6 +1,7 @@
 import os
 import logging
 import sys
+from urllib.parse import urlparse
 
 from requests_aws4auth import AWS4Auth
 
@@ -19,7 +20,9 @@ class ServiceSettings:
         self.dashboards_port = os.environ.get("DASHBOARDS_PORT", "443")
         self.account_id = account_id
         self.region = region
-        self.host = host
+        # Normalize host: allow ES_ENDPOINT to be either hostname or full URL
+        parsed = urlparse(host)
+        self.host = parsed.netloc or parsed.path or host
         self.credentials = credentials
         self.aws_auth = aws_auth
         self.service = service
@@ -42,7 +45,9 @@ class ServiceSettings:
     def source_settings_from_event(self, event):
         try:
             self.region = event['ResourceProperties']['Region']
-            self.host = event['ResourceProperties']['Host']
+            raw_host = event['ResourceProperties']['Host']
+            parsed = urlparse(raw_host)
+            self.host = parsed.netloc or parsed.path or raw_host
             self.account_id = event['ResourceProperties']['AccountID']
         except KeyError:
             logging.info("Event not triggered through Custom Resource - ResourceProperties not available. Defaulting to Env Vars")

@@ -95,6 +95,29 @@ Important! By the default, OpenSearch dashboard will be publicly accessible from
 - **If using CloudFront**: Console → CloudFront → Distributions → copy the Distribution Domain name (e.g., `dxxxxx.cloudfront.net`).
 - **If using ALB**: Console → EC2 → Load Balancers → select your ALB → copy the **DNS name** (e.g., `my-alb-1234.us-east-1.elb.amazonaws.com`). If the app expects a custom hostname, add a `Host` header in curl (see below).
 
+## Solution changes (Oct 2025)
+
+- Top 10 → Top 20: All “Top 10 …” visualizations updated to “Top 20 …”.
+- Top 20 ASN: Replaced legacy “Top 10 WebACL” panel with “Top 20 ASN”, aggregating on indexed field `req_asn` (populated from header `httpRequest.headers.section-io-geo-asn`, see ingest pipeline).
+- Canonical fields (indexed, no runtime fields):
+  - `req_true_client_ip`
+  - `req_country_code` and canonical `real_country_code`
+  - `req_asn`
+- Automation:
+  - CDK provisions a maintenance Lambda (osdfwDashboardsFixer) that enforces saved objects (including Top 20 ASN and Countries) and embeds the panels into the `WAFDashboard`.
+  - Post‑deploy Custom Resource auto‑invokes the fixer on every Create/Update.
+  - Nightly EventBridge rule re‑enforces (self‑heal).
+- Fresh‑stack assumption: For fresh stacks, no reindex is required. Existing historical data is not backfilled; new ingested data conforms to the new mappings and pipelines.
+
+Validation outputs after deployment/invoke include a JSON map: `{"verified": {"filters": true, "allcountries": true, "blockedcountries": true, "top10countries": true, "top10webacl": true}}`.
+
+Rebase guidance: If you want a clean history without experimental code, rebase or fork from the public repo and apply only these additions:
+- CDK resources and wiring for osdfwDashboardsFixer + nightly rule.
+- Ingest pipeline and index template updates for `req_true_client_ip`, `req_country_code`/`real_country_code`, `req_asn`.
+- Updated saved objects (Top 20 visualizations and Filters control bindings).
+
+---
+
 ### Generate test traffic (cURL)
 Replace placeholders before running.
 
@@ -118,7 +141,7 @@ curl -k -sS \
   https://<your-alb-dns-name>/test
 ```
 
-After 1–2 requests, refresh the dashboard. You should see `Top 10 IP Addresses` populated with `true_client_ip` and associated metrics.
+After 1–2 requests, refresh the dashboard. You should see `Top 20 IP Addresses` populated with `true_client_ip` and associated metrics.
 
 ### Rebuild customizer Lambda ZIP and deploy
 

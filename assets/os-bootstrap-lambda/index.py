@@ -120,6 +120,10 @@ if (ctx.containsKey('httpRequest') && ctx.httpRequest != null && ctx.httpRequest
       if (h != null && h.containsKey('name') && h.containsKey('value')) {
         String n = h.name == null ? "" : h.name.toString().toLowerCase();
         if (n == 'x-forwarded-for' || n == 'true-client-ip') { xff = h.value == null ? null : h.value.toString(); }
+        // Persist header-derived fields
+        if (n == 'true-client-ip' && (ctx.req_true_client_ip == null || ctx.req_true_client_ip == '')) { ctx.req_true_client_ip = h.value == null ? null : h.value.toString(); }
+        if (n == 'section-io-geo-country-code' && (ctx.req_country_code == null || ctx.req_country_code == '')) { ctx.req_country_code = h.value == null ? null : h.value.toString(); }
+        if (n == 'section-io-geo-asn' && (ctx.req_asn == null || ctx.req_asn == '')) { ctx.req_asn = h.value == null ? null : h.value.toString(); }
         if (n == 'host' && (ctx.host == null || ctx.host == '')) { ctx.host = h.value == null ? null : h.value.toString(); }
         if (n == 'user-agent' && (ctx.UserAgent == null || ctx.UserAgent == '')) { ctx.UserAgent = h.value == null ? null : h.value.toString(); }
       }
@@ -136,12 +140,15 @@ if (xff != null) {
   int idx = xff.indexOf(',');
   String first = idx >= 0 ? xff.substring(0, idx).trim() : xff.trim();
   ctx.true_client_ip = first; ctx.true_client_ip_str = first;
+  if (ctx.req_true_client_ip == null || ctx.req_true_client_ip == '') { ctx.req_true_client_ip = first; }
 } else if (ctx.containsKey('httpRequest') && ctx.httpRequest != null && ctx.httpRequest.containsKey('clientIp') && ctx.httpRequest.clientIp != null) {
   ctx.true_client_ip = ctx.httpRequest.clientIp.toString();
   ctx.true_client_ip_str = ctx.true_client_ip;
+  if (ctx.req_true_client_ip == null || ctx.req_true_client_ip == '') { ctx.req_true_client_ip = ctx.true_client_ip; }
 } else if (ctx.containsKey('clientIp') && ctx.clientIp != null) {
   ctx.true_client_ip = ctx.clientIp.toString();
   ctx.true_client_ip_str = ctx.true_client_ip;
+  if (ctx.req_true_client_ip == null || ctx.req_true_client_ip == '') { ctx.req_true_client_ip = ctx.true_client_ip; }
 }
 if (ctx.containsKey('httpRequest') && ctx.httpRequest != null && ctx.httpRequest.containsKey('country') && ctx.httpRequest.country != null) { ctx.real_country_code = ctx.httpRequest.country.toString(); }
 // Derive uri if present in httpRequest
@@ -224,6 +231,10 @@ if (ctx.containsKey('httpRequest') && ctx.httpRequest != null) {
                     "httpMethod": {"type": "keyword", "ignore_above": 256},
                     "httpVersion": {"type": "keyword", "ignore_above": 256},
                     "UserAgent": {"type": "keyword", "ignore_above": 512},
+                    # Indexed header-derived fields requested by team
+                    "req_true_client_ip": {"type": "keyword", "ignore_above": 256},
+                    "req_country_code": {"type": "keyword", "ignore_above": 256},
+                    "req_asn": {"type": "keyword", "ignore_above": 256},
                     "WebACL": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
                     "Rule": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
                     "RuleType": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
@@ -264,6 +275,9 @@ if (ctx.containsKey('httpRequest') && ctx.httpRequest != null) {
                     "uri": {"type": "keyword", "ignore_above": 2048},
                     "true_client_ip": {"type": "keyword", "ignore_above": 256},
                     "real_country_code": {"type": "keyword", "ignore_above": 256},
+                    "req_true_client_ip": {"type": "keyword", "ignore_above": 256},
+                    "req_country_code": {"type": "keyword", "ignore_above": 256},
+                    "req_asn": {"type": "keyword", "ignore_above": 256},
                     "httpMethod": {"type": "keyword", "ignore_above": 256},
                     "httpVersion": {"type": "keyword", "ignore_above": 256},
                     "httpRequest.country.keyword": {"type": "alias", "path": "real_country_code"},

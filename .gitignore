@@ -7,4 +7,36 @@ target
 .idea/
 dist/
 cdk.out/
+# CDK temp outputs
+.cdk-out-*/
+build/
+
+# Vendored wheels / site-packages dropped into assets/src by local builds
+assets/src/__pycache__/
+assets/src/bin/
+assets/src/*.dist-info/
+assets/src/*-*.dist-info/
+assets/src/certifi/
+assets/src/charset_normalizer/
+assets/src/crhelper/
+assets/src/dateutil/
+assets/src/events/
+assets/src/furl/
+assets/src/idna/
+assets/src/opensearchpy/
+assets/src/orderedmultidict/
+assets/src/requests/
+assets/src/urllib3/
+assets/src/six.py
+assets/src/six-*
+
+# Legacy/binary artifacts no longer used by CDK
+assets/os-customizer-lambda-fixed.zip
 target/
+
+# Ignore build/vendor under os-customizer-build, keep our source files
+assets/os-customizer-build/*
+!assets/os-customizer-build/fix_country_objects.py
+!assets/os-customizer-build/dashboards_definitions_json/**
+!assets/os-customizer-build/helpers/**
+!assets/os-customizer-build/lambda_function.py
